@@ -10,26 +10,46 @@ import (
 	"regexp"
 )
 
+type Product struct {
+	Name string
+	URL  string
+}
+
 // Handler is the entry point for Vercel.
 func Handler(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("--- Notitracker: Starting High-Frequency Scrape ---")
+	fmt.Println("--- Notitracker: Starting Batch Scrape ---")
 
-	targetURL := "https://www.flipkart.com/samsung-419-l-frost-free-double-door-3-star-convertible-refrigerator-5-in-1-digital-inverter-wifi-enabled-bespoke-ai/p/itm8e086361f0c13?pid=RFRH3T3HQQEH6QZM"
-
-	price, mrp, err := scrapeFlipkart(targetURL)
-	if err != nil {
-		fmt.Printf("SCRAPE ERROR: %v\n", err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `{"status":"error","message":"%s"}`, err.Error())
-		return
+	// 1. ADD YOUR LINKS HERE
+	productList := []Product{
+		{
+			Name: "Samsung 419 L Refrigerator",
+			URL:  "https://www.flipkart.com/samsung-419-l-frost-free-double-door-3-star-convertible-refrigerator-5-in-1-digital-inverter-wifi-enabled-bespoke-ai/p/itm8e086361f0c13?pid=RFRH3T3HQQEH6QZM",
+		},
+		{
+			Name: "Samsung 653 L Side-by-Side",
+			URL:  "https://www.flipkart.com/samsung-653-l-frost-free-side-by-side-3-star-refrigerator-with-ai-and-wifi-convertible-5-in-1-digital-inverter/p/itm7e086361f0c13?pid=RFRGRZSQ4GQUHFE2",
+		},
+		// Add more products as needed
 	}
 
-	sendToDiscord("Samsung 419 L Refrigerator", price, mrp)
+	summary := make(map[string]interface{})
+
+	for _, p := range productList {
+		price, mrp, err := scrapeFlipkart(p.URL)
+		if err != nil {
+			fmt.Printf("SCRAPE ERROR [%s]: %v\n", p.Name, err)
+			summary[p.Name] = fmt.Sprintf("Error: %v", err)
+			continue
+		}
+
+		fmt.Printf("SUCCESS [%s]: Price ₹%.0f\n", p.Name, price)
+		sendToDiscord(p.Name, price, mrp)
+		summary[p.Name] = price
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, `{"status":"success","price":%v,"mrp":%v}`, price, mrp)
+	json.NewEncoder(w).Encode(summary)
 }
 
 func scrapeFlipkart(url string) (float64, float64, error) {
@@ -81,7 +101,7 @@ func scrapeFlipkart(url string) (float64, float64, error) {
 		}
 	}
 
-	// --- 2. EXTRACT MRP (The Fix) ---
+	// --- 2. EXTRACT MRP ---
 	mrpPatterns := []string{
 		`"mrp":\{"value":(\d+)`,
 		`"strikeOffPrice":\{"value":(\d+)`,
@@ -97,11 +117,9 @@ func scrapeFlipkart(url string) (float64, float64, error) {
 		}
 	}
 
-	// If MRP is still 0 after all patterns, fallback to price to avoid div-by-zero
 	if mrp == 0 { mrp = price }
-
 	if price == 0 {
-		return 0, 0, fmt.Errorf("parsing failed: price missing (HTML len: %d)", len(html))
+		return 0, 0, fmt.Errorf("parsing failed: price missing")
 	}
 
 	return price, mrp, nil
@@ -111,7 +129,6 @@ func sendToDiscord(name string, price, mrp float64) {
 	webhookURL := os.Getenv("DISCORD_WEBHOOK_URL")
 	if webhookURL == "" { return }
 
-	// Calculate discount percentage
 	discount := 0.0
 	if mrp > 0 {
 		discount = ((mrp - price) / mrp) * 100
@@ -127,7 +144,7 @@ func sendToDiscord(name string, price, mrp float64) {
 					{"name": "MRP", "value": fmt.Sprintf("₹%.0f", mrp), "inline": true},
 					{"name": "Discount", "value": fmt.Sprintf("%.1f%%", discount), "inline": true},
 				},
-				"footer": map[string]string{"text": "1-Minute High-Frequency Poller"},
+				"footer": map[string]string{"text": "Batch Poller • Notitracker"},
 			},
 		},
 	}
