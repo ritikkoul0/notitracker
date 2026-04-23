@@ -4,65 +4,68 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"regexp"
 )
 
-type FlipkartResponse struct {
-	Data struct {
-		SellingPrice float64 `json:"selling_price"`
-		MRP          float64 `json:"mrp"`
-	} `json:"data"`
+func Handler(w http.ResponseWriter, r *http.Request) {
+	url := "https://www.flipkart.com/samsung-419-l-frost-free-double-door-3-star-convertible-refrigerator-5-in-1-digital-inverter-wifi-enabled-bespoke-ai/p/itm8e086361f0c13?pid=RFRH3T3HQQEH6QZM"
+	
+	price, mrp, err := scrapeFlipkart(url)
+	if err != nil {
+		http.Error(w, "Scraping failed", 500)
+		return
+	}
+
+	sendToDiscord("Samsung 419 L Double Door", price, mrp)
+
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"status":"success","price":%v}`, price)
 }
 
-func Handler(w http.ResponseWriter, r *http.Request) {
-	// 1. Fetch Price
-	url := "https://flipkart-apis.p.rapidapi.com/backend/rapidapi/product-details?pid=RFRH3T3HQQEH6QZM"
-	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Add("x-rapidapi-host", "flipkart-apis.p.rapidapi.com")
-	req.Header.Add("x-rapidapi-key", os.Getenv("RAPID_API_KEY"))
-
+func scrapeFlipkart(url string) (float64, float64, error) {
 	client := &http.Client{}
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
 	resp, err := client.Do(req)
 	if err != nil {
-		http.Error(w, "Failed to reach Flipkart", 500)
-		return
+		return 0, 0, err
 	}
 	defer resp.Body.Close()
 
-	var result FlipkartResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		http.Error(w, "JSON Decode Error", 500)
-		return
-	}
+	body, _ := io.ReadAll(resp.Body)
+	html := string(body)
 
-	// 2. Notify Discord
-	sendToDiscord(result.Data.SellingPrice, result.Data.MRP)
+	priceRegex := regexp.MustCompile(`"price":"(\d+)"`)
+	mrpRegex := regexp.MustCompile(`"mrp":(\d+)`)
 
-	// 3. Response for Vercel Logs
-	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"status":"notified","price":%v}`, result.Data.SellingPrice)
+	var price, mrp float64
+	pMatches := priceRegex.FindStringSubmatch(html)
+	mMatches := mrpRegex.FindStringSubmatch(html)
+
+	if len(pMatches) > 1 { fmt.Sscanf(pMatches[1], "%f", &price) }
+	if len(mMatches) > 1 { fmt.Sscanf(mMatches[1], "%f", &mrp) }
+
+	return price, mrp, nil
 }
 
-func sendToDiscord(price, mrp float64) {
+func sendToDiscord(name string, price, mrp float64) {
 	webhookURL := os.Getenv("DISCORD_WEBHOOK_URL")
-	if webhookURL == "" {
-		return
-	}
-
 	payload := map[string]interface{}{
 		"embeds": []map[string]interface{}{
 			{
-				"title": "🛒 Price Poller: Samsung Refrigerator",
-				"color": 3066993, // Green
+				"title": name,
+				"color": 3447003,
 				"fields": []map[string]interface{}{
-					{"name": "Selling Price", "value": fmt.Sprintf("₹%.2f", price), "inline": true},
-					{"name": "MRP", "value": fmt.Sprintf("₹%.2f", mrp), "inline": true},
+					{"name": "Price", "value": fmt.Sprintf("₹%.0f", price), "inline": true},
+					{"name": "MRP", "value": fmt.Sprintf("₹%.0f", mrp), "inline": true},
 				},
 			},
 		},
 	}
-
 	body, _ := json.Marshal(payload)
 	http.Post(webhookURL, "application/json", bytes.NewBuffer(body))
 }
