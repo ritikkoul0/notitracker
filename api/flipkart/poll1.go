@@ -10,7 +10,6 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -24,19 +23,20 @@ type ScrapeResult struct {
 	Discord string `json:"discord"`
 }
 
-// Global transport to reuse TCP/TLS connections across 15 requests
-var sharedTransport = &http.Transport{
-	MaxIdleConns:        25,
-	MaxIdleConnsPerHost: 25,
-	IdleConnTimeout:     90 * time.Second,
+// Global client with aggressive timeouts
+var fastClient = &http.Client{
+	Timeout: 5 * time.Second, 
+	Transport: &http.Transport{
+		MaxIdleConns:        10,
+		IdleConnTimeout:     30 * time.Second,
+		DisableKeepAlives:   false,
+	},
 }
 
 func Handler(w http.ResponseWriter, r *http.Request) {
-	// Hard 28s timeout to beat the 30s gateway kill-switch
-	ctx, cancel := context.WithTimeout(r.Context(), 28*time.Second)
+	// Hobby limit is 10s. We MUST finish by 9s.
+	ctx, cancel := context.WithTimeout(r.Context(), 9*time.Second)
 	defer cancel()
-
-	fmt.Println("--- Notitracker: Starting 30s-Optimized Batch ---")
 
 	productList := []Product{
 		{"Havells Rice Cooker", "https://www.flipkart.com/havells-riso-plus-1-8-l-2-bowl-electric-rice-cooker/p/itm9dc31cc3694d7?pid=ECKGZPNF6PSWGBJN"},
@@ -44,65 +44,41 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		{"Atomberg Renesa Fan", "https://www.flipkart.com/atomberg-renesa-halo-smart-voice-controlled-high-air-flow-low-noise-led-speed-indicator-3-year-warranty-bldc-motor-remote-1200-mm-ceiling-fan/p/itm39f1a608fb2aa?pid=FANH9H58ZJ3T5UJM"},
 		{"Samsung Bespoke Fridge", "https://www.flipkart.com/samsung-419-l-frost-free-double-door-3-star-convertible-refrigerator-5-in-1-digital-inverter-wifi-enabled-bespoke-ai/p/itm8e086361f0c13?pid=RFRH3T3HQQEH6QZM"},
 		{"Whirlpool Chimney", "https://www.flipkart.com/whirlpool-cgbf-pro-903-hac-bk-hood-auto-clean-curved-glass-90-cm-11-years-motor-warranty-heat-autoclean-gesture-control-baffle-filter-powerful-suction-low-noise-wall-mounted-black-1500-cmh-chimney/p/itm12e07fcfaaef4?pid=CHYGT59WPSPNCFG6"},
-		}
-
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	results := make(map[string]ScrapeResult)
-	
-	// SEMAPHORE: Increased to 5 for speed, but staying low enough to prevent 403 blocks
-	sem := make(chan struct{}, 5)
-
-	for _, p := range productList {
-		wg.Add(1)
-		go func(prod Product) {
-			defer wg.Done()
-			
-			select {
-			case <-ctx.Done(): // Stop immediately if we hit 28s
-				return
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			}
-
-			price, mrp, offers, err := scrapeFlipkart(ctx, prod.URL)
-			
-			mu.Lock()
-			defer mu.Unlock()
-
-			if err != nil {
-				fmt.Printf("[FAIL] %s | %v\n", prod.Name, err)
-				results[prod.Name] = ScrapeResult{Price: err.Error(), Discord: "N/A"}
-			} else {
-				fmt.Printf("[SUCCESS] %s | ₹%.0f\n", prod.Name, price)
-				// Discord status logic
-				dErr := sendToDiscord(prod.Name, price, mrp, offers, prod.URL)
-				status := "Sent"
-				if dErr != nil {
-					status = dErr.Error()
-				}
-				results[prod.Name] = ScrapeResult{Price: fmt.Sprintf("₹%.0f", price), Discord: status}
-			}
-		}(p)
 	}
 
-	wg.Wait()
-	
+	results := make(map[string]ScrapeResult)
+
+	for _, p := range productList {
+		// Check if we still have time left in our 9s budget
+		if ctx.Err() != nil {
+			results[p.Name] = ScrapeResult{Price: "Timed Out", Discord: "N/A"}
+			continue
+		}
+
+		price, mrp, offers, err := scrapeFlipkart(ctx, p.URL)
+		if err != nil {
+			results[p.Name] = ScrapeResult{Price: err.Error(), Discord: "N/A"}
+			continue
+		}
+
+		dStatus := "Sent"
+		if dErr := sendToDiscord(p.Name, price, mrp, offers, p.URL); dErr != nil {
+			dStatus = dErr.Error()
+		}
+		
+		results[p.Name] = ScrapeResult{Price: fmt.Sprintf("₹%.0f", price), Discord: dStatus}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(results)
 }
 
 func scrapeFlipkart(ctx context.Context, url string) (float64, float64, string, error) {
-	client := &http.Client{
-		Timeout:   8 * time.Second,
-		Transport: sharedTransport,
-	}
-	
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	req.Header.Set("Referer", "https://www.google.com/")
 
-	resp, err := client.Do(req)
+	resp, err := fastClient.Do(req)
 	if err != nil { return 0, 0, "", err }
 	defer resp.Body.Close()
 
@@ -125,13 +101,12 @@ func scrapeFlipkart(ctx context.Context, url string) (float64, float64, string, 
 
 	if price == 0 { return 0, 0, "", fmt.Errorf("Parse Fail") }
 	if mrp == 0 { mrp = price }
-	
 	return price, mrp, offers, nil
 }
 
 func sendToDiscord(name string, price, mrp float64, offers, link string) error {
 	webhookURL := os.Getenv("DISCORD_WEBHOOK_URL")
-	if webhookURL == "" { return fmt.Errorf("Env Missing") }
+	if webhookURL == "" { return nil }
 
 	discount := 0.0
 	if mrp > 0 { discount = ((mrp - price) / mrp) * 100 }
@@ -139,9 +114,7 @@ func sendToDiscord(name string, price, mrp float64, offers, link string) error {
 	payload := map[string]interface{}{
 		"embeds": []map[string]interface{}{
 			{
-				"title": name,
-				"url":   link,
-				"color": 3066993,
+				"title": name, "url": link, "color": 3066993,
 				"fields": []map[string]interface{}{
 					{"name": "Price", "value": fmt.Sprintf("₹%.0f", price), "inline": true},
 					{"name": "Disc", "value": fmt.Sprintf("%.0f%%", discount), "inline": true},
@@ -150,13 +123,16 @@ func sendToDiscord(name string, price, mrp float64, offers, link string) error {
 			},
 		},
 	}
-	
 	b, _ := json.Marshal(payload)
-	dClient := &http.Client{Timeout: 4 * time.Second}
-	resp, err := dClient.Post(webhookURL, "application/json", bytes.NewBuffer(b))
+	// Dedicated timeout for Discord
+	dCtx, dCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer dCancel()
+	
+	req, _ := http.NewRequestWithContext(dCtx, "POST", webhookURL, bytes.NewBuffer(b))
+	req.Header.Set("Content-Type", "application/json")
+	
+	resp, err := fastClient.Do(req)
 	if err != nil { return err }
 	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode > 299 { return fmt.Errorf("HTTP %d", resp.StatusCode) }
 	return nil
 }
