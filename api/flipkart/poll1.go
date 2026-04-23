@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
 	"net/http"
 	"os"
 	"regexp"
@@ -38,7 +37,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	fmt.Println("--- Notitracker: Starting 30s-Optimized Batch ---")
-	startTime := time.Now()
 
 	productList := []Product{
 		{"Havells Rice Cooker", "https://www.flipkart.com/havells-riso-plus-1-8-l-2-bowl-electric-rice-cooker/p/itm9dc31cc3694d7?pid=ECKGZPNF6PSWGBJN"},
