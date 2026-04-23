@@ -19,8 +19,14 @@ type Product struct {
 	URL  string
 }
 
+type ScrapeResult struct {
+	Price   string `json:"price"`
+	Discord string `json:"discord_status"`
+}
+
 func Handler(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("--- Notitracker: Stealth Batch Scrape Started ---")
+	fmt.Println("--- Notitracker: Starting High-Visibility Batch Scrape ---")
+	startTime := time.Now()
 
 	productList := []Product{
 		{"Havells Rice Cooker", "https://www.flipkart.com/havells-riso-plus-1-8-l-2-bowl-electric-rice-cooker/p/itm9dc31cc3694d7?pid=ECKGZPNF6PSWGBJN"},
@@ -42,33 +48,49 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	results := make(map[string]string)
-	sem := make(chan struct{}, 2) // Reduced to 2 concurrent to be more "human"
+	results := make(map[string]ScrapeResult)
+	sem := make(chan struct{}, 2) // Maintain low concurrency to avoid 403
 
 	for i, p := range productList {
 		wg.Add(1)
 		go func(prod Product, idx int) {
 			defer wg.Done()
-			
-			// Small staggered start (jitter)
-			time.Sleep(time.Duration(idx*300) * time.Millisecond)
-			
+			time.Sleep(time.Duration(idx*300) * time.Millisecond) // Jitter
+
 			sem <- struct{}{}
+			fmt.Printf("[SCRAPE] Starting: %s\n", prod.Name)
 			price, mrp, offers, err := scrapeFlipkart(prod.URL)
 			<-sem
 
-			mu.Lock()
+			res := ScrapeResult{}
 			if err != nil {
-				results[prod.Name] = err.Error()
+				fmt.Printf("[FAIL] %s | Error: %v\n", prod.Name, err)
+				res.Price = err.Error()
+				res.Discord = "Skipped"
 			} else {
-				results[prod.Name] = fmt.Sprintf("₹%.0f", price)
-				sendToDiscord(prod.Name, price, mrp, offers, prod.URL)
+				fmt.Printf("[SUCCESS] %s | Price: ₹%.0f\n", prod.Name, price)
+				res.Price = fmt.Sprintf("₹%.0f", price)
+				
+				// Hit Discord and log the outcome
+				discordErr := sendToDiscord(prod.Name, price, mrp, offers, prod.URL)
+				if discordErr != nil {
+					fmt.Printf("[DISCORD ERROR] %s | %v\n", prod.Name, discordErr)
+					res.Discord = discordErr.Error()
+				} else {
+					fmt.Printf("[DISCORD OK] %s\n", prod.Name)
+					res.Discord = "Sent"
+				}
 			}
+
+			mu.Lock()
+			results[prod.Name] = res
 			mu.Unlock()
 		}(p, i)
 	}
 
 	wg.Wait()
+	fmt.Printf("--- Batch Finished | Total Time: %s ---\n", time.Since(startTime))
+	
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(results)
 }
@@ -77,25 +99,20 @@ func scrapeFlipkart(url string) (float64, float64, string, error) {
 	client := &http.Client{Timeout: 6 * time.Second}
 	req, _ := http.NewRequest("GET", url, nil)
 
-	// Varying User-Agents slightly
 	uas := []string{
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
 	}
 	req.Header.Set("User-Agent", uas[rand.Intn(len(uas))])
-	
-	// Critical: Adding Referer and Origin to look like real navigation
-	referers := []string{"https://www.google.com/", "https://www.bing.com/", "https://www.flipkart.com/"}
-	req.Header.Set("Referer", referers[rand.Intn(len(referers))])
+	req.Header.Set("Referer", "https://www.google.com/")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-IN,en;q=0.9")
 
 	resp, err := client.Do(req)
 	if err != nil { return 0, 0, "", err }
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return 0, 0, "", fmt.Errorf("HTTP %d", resp.StatusCode)
+		return 0, 0, "", fmt.Errorf("Flipkart HTTP %d", resp.StatusCode)
 	}
 
 	body, _ := io.ReadAll(resp.Body)
@@ -114,12 +131,14 @@ func scrapeFlipkart(url string) (float64, float64, string, error) {
 	if len(matches) > 0 { offerSummary = strings.Trim(matches[0][1], `"`) }
 
 	if mrp == 0 { mrp = price }
+	if price == 0 { return 0, 0, "", fmt.Errorf("Price extraction failed") }
+	
 	return price, mrp, offerSummary, nil
 }
 
-func sendToDiscord(name string, price, mrp float64, offers, link string) {
+func sendToDiscord(name string, price, mrp float64, offers, link string) error {
 	webhookURL := os.Getenv("DISCORD_WEBHOOK_URL")
-	if webhookURL == "" { return }
+	if webhookURL == "" { return fmt.Errorf("Discord URL missing") }
 
 	discount := 0.0
 	if mrp > 0 { discount = ((mrp - price) / mrp) * 100 }
@@ -138,6 +157,14 @@ func sendToDiscord(name string, price, mrp float64, offers, link string) {
 			},
 		},
 	}
+	
 	b, _ := json.Marshal(payload)
-	http.Post(webhookURL, "application/json", bytes.NewBuffer(b))
+	resp, err := http.Post(webhookURL, "application/json", bytes.NewBuffer(b))
+	if err != nil { return err }
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 204 && resp.StatusCode != 200 {
+		return fmt.Errorf("Discord HTTP %d", resp.StatusCode)
+	}
+	return nil
 }
