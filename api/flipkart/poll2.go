@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
 	"net/http"
 	"os"
 	"regexp"
@@ -38,7 +37,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	fmt.Println("--- Notitracker: Starting 30s-Optimized Batch ---")
-	startTime := time.Now()
 
 	productList := []Product{
 		{"AO Smith Water Purifier", "https://www.flipkart.com/ao-smith-z2-5-l-ro-water-purifier-6-stages-purification-digital-display-under-sink-placement-complimentary-faucet-suitable-all-borewell-tanker-municipality/p/itm67fa720667ccb?pid=WAPF943KSMEKKRH9"},
