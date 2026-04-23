@@ -1,9 +1,7 @@
 {
-  "version": 2,
-  "crons": [
-    {
-      "path": "/api/poll",
-      "schedule": "0 0 1 1 *"
+  "functions": {
+    "api/**/*.go": {
+      "regions": ["bom1"]
     }
-  ]
+  }
 }
