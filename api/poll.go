@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"time"
 )
 
 type Product struct {
@@ -15,136 +16,99 @@ type Product struct {
 	URL  string
 }
 
-// Handler is the entry point for Vercel.
 func Handler(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("--- Notitracker: Starting Batch Scrape ---")
+	fmt.Println("--- Notitracker: Starting Full Batch Scrape ---")
 
-	// 1. ADD YOUR LINKS HERE
 	productList := []Product{
-		{
-			Name: "Samsung 419 L Refrigerator",
-			URL:  "https://www.flipkart.com/samsung-419-l-frost-free-double-door-3-star-convertible-refrigerator-5-in-1-digital-inverter-wifi-enabled-bespoke-ai/p/itm8e086361f0c13?pid=RFRH3T3HQQEH6QZM",
-		},
-		{
-			Name: "Samsung 653 L Side-by-Side",
-			URL:  "https://www.flipkart.com/samsung-653-l-frost-free-side-by-side-3-star-refrigerator-with-ai-and-wifi-convertible-5-in-1-digital-inverter/p/itm7e086361f0c13?pid=RFRGRZSQ4GQUHFE2",
-		},
-		// Add more products as needed
+		{"Havells Rice Cooker", "https://www.flipkart.com/havells-riso-plus-1-8-l-2-bowl-electric-rice-cooker/p/itm9dc31cc3694d7?pid=ECKGZPNF6PSWGBJN"},
+		{"LG Microwave Oven", "https://www.flipkart.com/lg-20-l-i-wave-technology-indian-cuisine-auto-cook-menu-steam-clean-anti-bacterial-cavity-health-plus-menu-grill-microwave-oven/p/itmdz5v2y3ckyu9y?pid=MRCDZ5VFHGD7F7UV"},
+		{"Atomberg Renesa Fan", "https://www.flipkart.com/atomberg-renesa-halo-smart-voice-controlled-high-air-flow-low-noise-led-speed-indicator-3-year-warranty-bldc-motor-remote-1200-mm-ceiling-fan/p/itm39f1a608fb2aa?pid=FANH9H58ZJ3T5UJM"},
+		{"Samsung Bespoke Fridge", "https://www.flipkart.com/samsung-419-l-frost-free-double-door-3-star-convertible-refrigerator-5-in-1-digital-inverter-wifi-enabled-bespoke-ai/p/itm8e086361f0c13?pid=RFRH3T3HQQEH6QZM"},
+		{"Whirlpool Chimney", "https://www.flipkart.com/whirlpool-cgbf-pro-903-hac-bk-hood-auto-clean-curved-glass-90-cm-11-years-motor-warranty-heat-autoclean-gesture-control-baffle-filter-powerful-suction-low-noise-wall-mounted-black-1500-cmh-chimney/p/itm12e07fcfaaef4?pid=CHYGT59WPSPNCFG6"},
+		{"AO Smith Water Purifier", "https://www.flipkart.com/ao-smith-z2-5-l-ro-water-purifier-6-stages-purification-digital-display-under-sink-placement-complimentary-faucet-suitable-all-borewell-tanker-municipality/p/itm67fa720667ccb?pid=WAPF943KSMEKKRH9"},
+		{"Prestige Hob", "https://www.flipkart.com/prestige-svachh-efficia-03-ai-8mm-thick-superior-toughened-glass-cast-iron-pan-support-glass-automatic-hob/p/itm1fdeb478eafc8?pid=GSTH5G9FFTPGMZGF"},
+		{"Whirlpool Washing Machine", "https://www.flipkart.com/whirlpool-7-kg-magic-clean-5-star-fully-automatic-top-load-washing-machine-grey/p/itm50fdb8ca1e478?pid=WMNGDSUXZS5BWH7H"},
+		{"Sony Bravia 65 inch TV", "https://www.flipkart.com/sony-bravia-2-ii-163-9-cm-65-inch-ultra-hd-4k-led-smart-google-tv-2025/p/itm79726a02d6955?pid=TVSHBYPVYRDZQG4B"},
+		{"Bajaj Steam Iron", "https://www.flipkart.com/bajaj-mx-45-steam-iron-2000-w/p/itm7f635ea3b19c1?pid=IRNHFYJGBTGPY5YP"},
+		{"Kent Egg Boiler", "https://www.flipkart.com/kent-super-egg-boiler-stainless-steel-body-heating-plate-automatic-turn-off-116069-cooker/p/itme6a3998ac7b46?pid=EGGFW2WJV4FNYFMM"},
+		{"Atomberg Exhaust Fan", "https://www.flipkart.com/atomberg-studio-exhaust-6-inch6-8wlow-noiseeasy-cleaninstallation-round-cut-153mm-150-mm-fan/p/itmf71412247ee19?pid=EXFFQGVDGYPBF9UD"},
+		{"Philips Air Fryer", "https://www.flipkart.com/philips-na120-00-uses-up-90-less-fat-1500w-rapid-air-technology-fryer/p/itmaf10e1713a251?pid=AFRHY864CKYUN2YH"},
+		{"Bosch Mixer Grinder", "https://www.flipkart.com/bosch-pro-1000-w-mixer-grinder/p/itm95c51f4a5bc94?pid=MIXHGPUMUGFECGNM"},
+		{"AO Smith Geyser", "https://www.flipkart.com/ao-smith-hse-shs-025-25-l-storage-water-geyser-2kw-vertical-designed-high-rise-buildings-8-bar-pressure-rating-longer-life-hard-conditions-blue-diamond-glass-lined-tank-bee-5-star-superior-energy-efficiency-power-savings/p/itm1a81ed23a8b92?pid=WGYGGKJXAZHNZVGR"},
 	}
 
-	summary := make(map[string]interface{})
-
+	results := make(map[string]string)
 	for _, p := range productList {
 		price, mrp, err := scrapeFlipkart(p.URL)
 		if err != nil {
-			fmt.Printf("SCRAPE ERROR [%s]: %v\n", p.Name, err)
-			summary[p.Name] = fmt.Sprintf("Error: %v", err)
+			results[p.Name] = fmt.Sprintf("Error: %v", err)
 			continue
 		}
-
-		fmt.Printf("SUCCESS [%s]: Price ₹%.0f\n", p.Name, price)
-		sendToDiscord(p.Name, price, mrp)
-		summary[p.Name] = price
+		
+		sendToDiscord(p.Name, price, mrp, p.URL)
+		results[p.Name] = fmt.Sprintf("Price: ₹%.0f", price)
+		
+		// Small delay to avoid triggering Flipkart's 529 protection
+		time.Sleep(500 * time.Millisecond) 
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(summary)
+	json.NewEncoder(w).Encode(results)
 }
 
 func scrapeFlipkart(url string) (float64, float64, error) {
-	client := &http.Client{}
+	client := &http.Client{Timeout: 5 * time.Second}
 	req, _ := http.NewRequest("GET", url, nil)
 
-	// Advanced Browser Spoofing
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-IN,en;q=0.9,hi-IN;q=0.8,hi;q=0.7,en-GB;q=0.6,en-US;q=0.5")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-IN,en-US;q=0.9,en;q=0.8")
 	req.Header.Set("Referer", "https://www.google.com/")
-	req.Header.Set("Origin", "https://www.flipkart.com")
-	req.Header.Set("Sec-Ch-Ua", `"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"`)
-	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
-	req.Header.Set("Sec-Ch-Ua-Platform", `"Windows"`)
-	req.Header.Set("Sec-Fetch-Dest", "document")
-	req.Header.Set("Sec-Fetch-Mode", "navigate")
-	req.Header.Set("Sec-Fetch-Site", "cross-site")
-	req.Header.Set("Sec-Fetch-User", "?1")
-	req.Header.Set("Upgrade-Insecure-Requests", "1")
 
 	resp, err := client.Do(req)
-	if err != nil {
-		return 0, 0, err
-	}
+	if err != nil { return 0, 0, err }
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		return 0, 0, fmt.Errorf("Flipkart Blocked (Status %d)", resp.StatusCode)
-	}
+	if resp.StatusCode != 200 { return 0, 0, fmt.Errorf("Status %d", resp.StatusCode) }
 
 	body, _ := io.ReadAll(resp.Body)
 	html := string(body)
 
 	var price, mrp float64
+	pricePatterns := []string{`"sellingPrice":\{"value":(\d+)`, `"price":(\d+)`, `"decimalValue":"(\d+)"`}
+	mrpPatterns := []string{`"mrp":\{"value":(\d+)`, `"strikeOffPrice":\{"value":(\d+)`, `"listPrice":\{"value":(\d+)`}
 
-	// --- 1. EXTRACT SELLING PRICE ---
-	pricePatterns := []string{
-		`"sellingPrice":\{"value":(\d+)`,
-		`"price":(\d+)`,
-		`"decimalValue":"(\d+)"`,
+	for _, p := range pricePatterns {
+		match := regexp.MustCompile(p).FindStringSubmatch(html)
+		if len(match) > 1 { fmt.Sscanf(match[1], "%f", &price); break }
 	}
-	for _, pattern := range pricePatterns {
-		re := regexp.MustCompile(pattern)
-		match := re.FindStringSubmatch(html)
-		if len(match) > 1 {
-			fmt.Sscanf(match[1], "%f", &price)
-			if price > 0 { break }
-		}
-	}
-
-	// --- 2. EXTRACT MRP ---
-	mrpPatterns := []string{
-		`"mrp":\{"value":(\d+)`,
-		`"strikeOffPrice":\{"value":(\d+)`,
-		`"listPrice":\{"value":(\d+)`,
-		`"mrp":(\d+)`,
-	}
-	for _, pattern := range mrpPatterns {
-		re := regexp.MustCompile(pattern)
-		match := re.FindStringSubmatch(html)
-		if len(match) > 1 {
-			fmt.Sscanf(match[1], "%f", &mrp)
-			if mrp > 0 { break }
-		}
+	for _, p := range mrpPatterns {
+		match := regexp.MustCompile(p).FindStringSubmatch(html)
+		if len(match) > 1 { fmt.Sscanf(match[1], "%f", &mrp); break }
 	}
 
 	if mrp == 0 { mrp = price }
-	if price == 0 {
-		return 0, 0, fmt.Errorf("parsing failed: price missing")
-	}
-
 	return price, mrp, nil
 }
 
-func sendToDiscord(name string, price, mrp float64) {
+func sendToDiscord(name string, price, mrp float64, link string) {
 	webhookURL := os.Getenv("DISCORD_WEBHOOK_URL")
 	if webhookURL == "" { return }
 
 	discount := 0.0
-	if mrp > 0 {
-		discount = ((mrp - price) / mrp) * 100
-	}
+	if mrp > 0 { discount = ((mrp - price) / mrp) * 100 }
 
 	payload := map[string]interface{}{
 		"embeds": []map[string]interface{}{
 			{
-				"title": "📊 Notitracker: " + name,
+				"title": name,
+				"url":   link,
 				"color": 3066993,
 				"fields": []map[string]interface{}{
 					{"name": "Current Price", "value": fmt.Sprintf("₹%.0f", price), "inline": true},
 					{"name": "MRP", "value": fmt.Sprintf("₹%.0f", mrp), "inline": true},
-					{"name": "Discount", "value": fmt.Sprintf("%.1f%%", discount), "inline": true},
+					{"name": "Discount", "value": fmt.Sprintf("%.0f%%", discount), "inline": true},
 				},
-				"footer": map[string]string{"text": "Batch Poller • Notitracker"},
 			},
 		},
 	}
