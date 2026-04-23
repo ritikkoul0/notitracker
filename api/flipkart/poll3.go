@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
 	"net/http"
 	"os"
 	"regexp"
@@ -38,7 +37,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	fmt.Println("--- Notitracker: Starting 30s-Optimized Batch ---")
-	startTime := time.Now()
 
 	productList := []Product{
 		{"Kent Egg Boiler", "https://www.flipkart.com/kent-super-egg-boiler-stainless-steel-body-heating-plate-automatic-turn-off-116069-cooker/p/itme6a3998ac7b46?pid=EGGFW2WJV4FNYFMM"},
