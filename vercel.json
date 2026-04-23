@@ -1,9 +1,0 @@
-{
-  "version": 2,
-  "crons": [
-    {
-      "path": "/api/poll",
-      "schedule": "1 0 * * *"
-    }
-  ]
-}
