@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -17,7 +19,7 @@ type Product struct {
 }
 
 func Handler(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("--- Notitracker: Starting Full Batch Scrape ---")
+	fmt.Println("--- Notitracker: Starting Parallel Batch Scrape ---")
 
 	productList := []Product{
 		{"Havells Rice Cooker", "https://www.flipkart.com/havells-riso-plus-1-8-l-2-bowl-electric-rice-cooker/p/itm9dc31cc3694d7?pid=ECKGZPNF6PSWGBJN"},
@@ -37,61 +39,76 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		{"AO Smith Geyser", "https://www.flipkart.com/ao-smith-hse-shs-025-25-l-storage-water-geyser-2kw-vertical-designed-high-rise-buildings-8-bar-pressure-rating-longer-life-hard-conditions-blue-diamond-glass-lined-tank-bee-5-star-superior-energy-efficiency-power-savings/p/itm1a81ed23a8b92?pid=WGYGGKJXAZHNZVGR"},
 	}
 
+	var wg sync.WaitGroup
+	var mu sync.Mutex
 	results := make(map[string]string)
+
 	for _, p := range productList {
-		price, mrp, err := scrapeFlipkart(p.URL)
-		if err != nil {
-			results[p.Name] = fmt.Sprintf("Error: %v", err)
-			continue
-		}
-		
-		sendToDiscord(p.Name, price, mrp, p.URL)
-		results[p.Name] = fmt.Sprintf("Price: ₹%.0f", price)
-		
-		// Small delay to avoid triggering Flipkart's 529 protection
-		time.Sleep(500 * time.Millisecond) 
+		wg.Add(1)
+		go func(prod Product) {
+			defer wg.Done()
+			
+			price, mrp, offers, err := scrapeFlipkart(prod.URL)
+			
+			mu.Lock()
+			if err != nil {
+				results[prod.Name] = fmt.Sprintf("Error: %v", err)
+			} else {
+				results[prod.Name] = fmt.Sprintf("₹%.0f", price)
+				sendToDiscord(prod.Name, price, mrp, offers, prod.URL)
+			}
+			mu.Unlock()
+		}(p)
 	}
+
+	wg.Wait()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(results)
 }
 
-func scrapeFlipkart(url string) (float64, float64, error) {
-	client := &http.Client{Timeout: 5 * time.Second}
+func scrapeFlipkart(url string) (float64, float64, string, error) {
+	client := &http.Client{Timeout: 8 * time.Second}
 	req, _ := http.NewRequest("GET", url, nil)
 
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-IN,en-US;q=0.9,en;q=0.8")
 	req.Header.Set("Referer", "https://www.google.com/")
 
 	resp, err := client.Do(req)
-	if err != nil { return 0, 0, err }
+	if err != nil { return 0, 0, "", err }
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 { return 0, 0, fmt.Errorf("Status %d", resp.StatusCode) }
+	if resp.StatusCode != 200 { return 0, 0, "", fmt.Errorf("Status %d", resp.StatusCode) }
 
 	body, _ := io.ReadAll(resp.Body)
 	html := string(body)
 
 	var price, mrp float64
-	pricePatterns := []string{`"sellingPrice":\{"value":(\d+)`, `"price":(\d+)`, `"decimalValue":"(\d+)"`}
-	mrpPatterns := []string{`"mrp":\{"value":(\d+)`, `"strikeOffPrice":\{"value":(\d+)`, `"listPrice":\{"value":(\d+)`}
+	var bankOffers []string
 
-	for _, p := range pricePatterns {
-		match := regexp.MustCompile(p).FindStringSubmatch(html)
-		if len(match) > 1 { fmt.Sscanf(match[1], "%f", &price); break }
-	}
-	for _, p := range mrpPatterns {
-		match := regexp.MustCompile(p).FindStringSubmatch(html)
-		if len(match) > 1 { fmt.Sscanf(match[1], "%f", &mrp); break }
+	// Price Parsing
+	priceRegex := regexp.MustCompile(`"sellingPrice":\{"value":(\d+)`)
+	mrpRegex := regexp.MustCompile(`"mrp":\{"value":(\d+)`)
+	
+	if m := priceRegex.FindStringSubmatch(html); len(m) > 1 { fmt.Sscanf(m[1], "%f", &price) }
+	if m := mrpRegex.FindStringSubmatch(html); len(m) > 1 { fmt.Sscanf(m[1], "%f", &mrp) }
+
+	// Bank Offers Parsing
+	offerRegex := regexp.MustCompile(`"((\d+%\s+Off\s+on\s+[A-Z\s]+Bank)|(Bank\s+Offer\s+₹\d+))"`)
+	matches := offerRegex.FindAllStringSubmatch(html, 2)
+	for _, m := range matches {
+		bankOffers = append(bankOffers, "• "+strings.Trim(m[1], `"`))
 	}
 
+	offerSummary := "No bank offers"
+	if len(bankOffers) > 0 { offerSummary = strings.Join(bankOffers, "\n") }
 	if mrp == 0 { mrp = price }
-	return price, mrp, nil
+
+	return price, mrp, offerSummary, nil
 }
 
-func sendToDiscord(name string, price, mrp float64, link string) {
+func sendToDiscord(name string, price, mrp float64, offers, link string) {
 	webhookURL := os.Getenv("DISCORD_WEBHOOK_URL")
 	if webhookURL == "" { return }
 
@@ -103,11 +120,12 @@ func sendToDiscord(name string, price, mrp float64, link string) {
 			{
 				"title": name,
 				"url":   link,
-				"color": 3066993,
+				"color": 3447003,
 				"fields": []map[string]interface{}{
-					{"name": "Current Price", "value": fmt.Sprintf("₹%.0f", price), "inline": true},
+					{"name": "Price", "value": fmt.Sprintf("₹%.0f", price), "inline": true},
 					{"name": "MRP", "value": fmt.Sprintf("₹%.0f", mrp), "inline": true},
 					{"name": "Discount", "value": fmt.Sprintf("%.0f%%", discount), "inline": true},
+					{"name": "🏦 Bank Offers", "value": offers, "inline": false},
 				},
 			},
 		},
