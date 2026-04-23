@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,11 +22,22 @@ type Product struct {
 
 type ScrapeResult struct {
 	Price   string `json:"price"`
-	Discord string `json:"discord_status"`
+	Discord string `json:"discord"`
+}
+
+// Global transport to reuse TCP/TLS connections across 15 requests
+var sharedTransport = &http.Transport{
+	MaxIdleConns:        25,
+	MaxIdleConnsPerHost: 25,
+	IdleConnTimeout:     90 * time.Second,
 }
 
 func Handler(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("--- Notitracker: Starting High-Visibility Batch Scrape ---")
+	// Hard 28s timeout to beat the 30s gateway kill-switch
+	ctx, cancel := context.WithTimeout(r.Context(), 28*time.Second)
+	defer cancel()
+
+	fmt.Println("--- Notitracker: Starting 30s-Optimized Batch ---")
 	startTime := time.Now()
 
 	productList := []Product{
@@ -49,71 +61,64 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	results := make(map[string]ScrapeResult)
-	sem := make(chan struct{}, 2) // Maintain low concurrency to avoid 403
+	
+	// SEMAPHORE: Increased to 5 for speed, but staying low enough to prevent 403 blocks
+	sem := make(chan struct{}, 5)
 
-	for i, p := range productList {
+	for _, p := range productList {
 		wg.Add(1)
-		go func(prod Product, idx int) {
+		go func(prod Product) {
 			defer wg.Done()
-			time.Sleep(time.Duration(idx*300) * time.Millisecond) // Jitter
-
-			sem <- struct{}{}
-			fmt.Printf("[SCRAPE] Starting: %s\n", prod.Name)
-			price, mrp, offers, err := scrapeFlipkart(prod.URL)
-			<-sem
-
-			res := ScrapeResult{}
-			if err != nil {
-				fmt.Printf("[FAIL] %s | Error: %v\n", prod.Name, err)
-				res.Price = err.Error()
-				res.Discord = "Skipped"
-			} else {
-				fmt.Printf("[SUCCESS] %s | Price: ₹%.0f\n", prod.Name, price)
-				res.Price = fmt.Sprintf("₹%.0f", price)
-				
-				// Hit Discord and log the outcome
-				discordErr := sendToDiscord(prod.Name, price, mrp, offers, prod.URL)
-				if discordErr != nil {
-					fmt.Printf("[DISCORD ERROR] %s | %v\n", prod.Name, discordErr)
-					res.Discord = discordErr.Error()
-				} else {
-					fmt.Printf("[DISCORD OK] %s\n", prod.Name)
-					res.Discord = "Sent"
-				}
+			
+			select {
+			case <-ctx.Done(): // Stop immediately if we hit 28s
+				return
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
 			}
 
+			price, mrp, offers, err := scrapeFlipkart(ctx, prod.URL)
+			
 			mu.Lock()
-			results[prod.Name] = res
-			mu.Unlock()
-		}(p, i)
+			defer mu.Unlock()
+
+			if err != nil {
+				fmt.Printf("[FAIL] %s | %v\n", prod.Name, err)
+				results[prod.Name] = ScrapeResult{Price: err.Error(), Discord: "N/A"}
+			} else {
+				fmt.Printf("[SUCCESS] %s | ₹%.0f\n", prod.Name, price)
+				// Discord status logic
+				dErr := sendToDiscord(prod.Name, price, mrp, offers, prod.URL)
+				status := "Sent"
+				if dErr != nil {
+					status = dErr.Error()
+				}
+				results[prod.Name] = ScrapeResult{Price: fmt.Sprintf("₹%.0f", price), Discord: status}
+			}
+		}(p)
 	}
 
 	wg.Wait()
-	fmt.Printf("--- Batch Finished | Total Time: %s ---\n", time.Since(startTime))
 	
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(results)
 }
 
-func scrapeFlipkart(url string) (float64, float64, string, error) {
-	client := &http.Client{Timeout: 6 * time.Second}
-	req, _ := http.NewRequest("GET", url, nil)
-
-	uas := []string{
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+func scrapeFlipkart(ctx context.Context, url string) (float64, float64, string, error) {
+	client := &http.Client{
+		Timeout:   8 * time.Second,
+		Transport: sharedTransport,
 	}
-	req.Header.Set("User-Agent", uas[rand.Intn(len(uas))])
+	
+	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	req.Header.Set("Referer", "https://www.google.com/")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
 
 	resp, err := client.Do(req)
 	if err != nil { return 0, 0, "", err }
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		return 0, 0, "", fmt.Errorf("Flipkart HTTP %d", resp.StatusCode)
-	}
+	if resp.StatusCode != 200 { return 0, 0, "", fmt.Errorf("HTTP %d", resp.StatusCode) }
 
 	body, _ := io.ReadAll(resp.Body)
 	html := string(body)
@@ -126,19 +131,19 @@ func scrapeFlipkart(url string) (float64, float64, string, error) {
 	if m := mrpReg.FindStringSubmatch(html); len(m) > 1 { fmt.Sscanf(m[1], "%f", &mrp) }
 
 	offerRegex := regexp.MustCompile(`"((\d+%\s+Off\s+on\s+[A-Z\s]+Bank)|(Bank\s+Offer\s+₹\d+))"`)
-	matches := offerRegex.FindAllStringSubmatch(html, 1)
-	offerSummary := "No current offers"
-	if len(matches) > 0 { offerSummary = strings.Trim(matches[0][1], `"`) }
+	match := offerRegex.FindStringSubmatch(html)
+	offers := "No offers"
+	if len(match) > 1 { offers = strings.Trim(match[1], `"`) }
 
+	if price == 0 { return 0, 0, "", fmt.Errorf("Parse Fail") }
 	if mrp == 0 { mrp = price }
-	if price == 0 { return 0, 0, "", fmt.Errorf("Price extraction failed") }
 	
-	return price, mrp, offerSummary, nil
+	return price, mrp, offers, nil
 }
 
 func sendToDiscord(name string, price, mrp float64, offers, link string) error {
 	webhookURL := os.Getenv("DISCORD_WEBHOOK_URL")
-	if webhookURL == "" { return fmt.Errorf("Discord URL missing") }
+	if webhookURL == "" { return fmt.Errorf("Env Missing") }
 
 	discount := 0.0
 	if mrp > 0 { discount = ((mrp - price) / mrp) * 100 }
@@ -151,7 +156,7 @@ func sendToDiscord(name string, price, mrp float64, offers, link string) error {
 				"color": 3066993,
 				"fields": []map[string]interface{}{
 					{"name": "Price", "value": fmt.Sprintf("₹%.0f", price), "inline": true},
-					{"name": "Discount", "value": fmt.Sprintf("%.0f%%", discount), "inline": true},
+					{"name": "Disc", "value": fmt.Sprintf("%.0f%%", discount), "inline": true},
 					{"name": "Bank", "value": offers, "inline": false},
 				},
 			},
@@ -159,12 +164,11 @@ func sendToDiscord(name string, price, mrp float64, offers, link string) error {
 	}
 	
 	b, _ := json.Marshal(payload)
-	resp, err := http.Post(webhookURL, "application/json", bytes.NewBuffer(b))
+	dClient := &http.Client{Timeout: 4 * time.Second}
+	resp, err := dClient.Post(webhookURL, "application/json", bytes.NewBuffer(b))
 	if err != nil { return err }
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 204 && resp.StatusCode != 200 {
-		return fmt.Errorf("Discord HTTP %d", resp.StatusCode)
-	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 { return fmt.Errorf("HTTP %d", resp.StatusCode) }
 	return nil
 }
