@@ -22,11 +22,11 @@ type FlipkartResponse struct {
 
 func Handler(w http.ResponseWriter, r *http.Request) {
 	pids := []string{
-		"RFRHGGAYZTXPZWWQ",
+		"ECKGZPNF6PSWGBJN",
+		"MRCDZ5VFHGD7F7UV",
+		"FANH9H58ZJ3T5UJM",
 		"RFRH3T3HQQEH6QZM",
-		"TVCG4926N3YV6V9S",
-		"MOBGHX9W9H2T9GZH",
-		"ACCGHY6T7Z7Z7Z7Z",
+		"CHYGT59WPSPNCFG6",
 	}
 
 	var wg sync.WaitGroup
