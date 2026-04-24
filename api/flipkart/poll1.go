@@ -1,107 +1,101 @@
 package handler
 
 import (
-	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
-	"regexp"
-	"strings"
-	"time"
+	"sync"
 )
 
-type Product struct {
-	Name string
-	URL  string
+type FlipkartResponse struct {
+	Success bool `json:"success"`
+	Data    struct {
+		Title string  `json:"title"`
+		Brand string  `json:"brand"`
+		URL   string  `json:"url"`
+		MRP   float64 `json:"mrp"`
+		Price float64 `json:"price"`
+	} `json:"data"`
 }
 
 func Handler(w http.ResponseWriter, r *http.Request) {
-	// Set the context to 9.5s (Vercel Hobby hard-kills at 10s)
-	ctx, cancel := context.WithTimeout(r.Context(), 9500*time.Millisecond)
-	defer cancel()
-
-	name := "Havells Rice Cooker"
-	url := "https://www.flipkart.com/havells-riso-plus-1-8-l-2-bowl-electric-rice-cooker/p/itm9dc31cc3694d7?pid=ECKGZPNF6PSWGBJN"
-
-	price, mrp, offers, err := streamScrape(ctx, url)
-	
-	result := "Success"
-	if err != nil {
-		result = err.Error()
-		fmt.Printf("[FAIL] %s: %v\n", name, err)
-	} else {
-		sendToDiscord(name, price, mrp, offers, url)
+	pids := []string{
+		"RFRHGGAYZTXPZWWQ",
+		"RFRH3T3HQQEH6QZM",
+		"TVCG4926N3YV6V9S",
+		"MOBGHX9W9H2T9GZH",
+		"ACCGHY6T7Z7Z7Z7Z",
 	}
+
+	var wg sync.WaitGroup
+	apiKey := os.Getenv("RAPID_API_KEY")
+	pincode := "560066"
+
+	for _, pid := range pids {
+		wg.Add(1)
+		// Launch each request in a concurrent goroutine
+		go func(p string) {
+			defer wg.Done()
+			fetchAndNotify(p, pincode, apiKey)
+		}(pid)
+	}
+
+	// Wait for all goroutines to finish before the function exits
+	wg.Wait()
 
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"product":"%s","status":"%s"}`, name, result)
+	fmt.Fprintf(w, `{"status":"completed","processed":%d}`, len(pids))
 }
 
-func streamScrape(ctx context.Context, url string) (float64, float64, string, error) {
-	client := &http.Client{Timeout: 9 * time.Second}
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36")
-	req.Header.Set("Referer", "https://www.google.com/")
+func fetchAndNotify(pid, pincode, apiKey string) {
+	url := fmt.Sprintf("https://real-time-flipkart-data2.p.rapidapi.com/product-details?pid=%s&pincode=%s", pid, pincode)
+	
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Add("x-rapidapi-host", "real-time-flipkart-data2.p.rapidapi.com")
+	req.Header.Add("x-rapidapi-key", apiKey)
 
+	client := &http.Client{}
 	resp, err := client.Do(req)
-	if err != nil { return 0, 0, "", err }
+	if err != nil {
+		return
+	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 { return 0, 0, "", fmt.Errorf("HTTP %d", resp.StatusCode) }
-
-	// Use a scanner to find price without downloading the full 600KB page
-	scanner := bufio.NewScanner(resp.Body)
-	priceReg := regexp.MustCompile(`"sellingPrice":\{"value":(\d+)`)
-	mrpReg := regexp.MustCompile(`"mrp":\{"value":(\d+)`)
-	offerReg := regexp.MustCompile(`"((\d+%\s+Off\s+on\s+[A-Z\s]+Bank)|(Bank\s+Offer\s+₹\d+))"`)
-
-	var price, mrp float64
-	var offers string
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		
-		if price == 0 {
-			if m := priceReg.FindStringSubmatch(line); len(m) > 1 { fmt.Sscanf(m[1], "%f", &price) }
-		}
-		if mrp == 0 {
-			if m := mrpReg.FindStringSubmatch(line); len(m) > 1 { fmt.Sscanf(m[1], "%f", &mrp) }
-		}
-		if offers == "" {
-			if m := offerReg.FindStringSubmatch(line); len(m) > 1 { offers = strings.Trim(m[1], `"`) }
-		}
-
-		// Optimization: If we found both prices, stop reading the body immediately
-		if price > 0 && mrp > 0 { break }
+	var result FlipkartResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err == nil && result.Success {
+		sendToDiscord(result.Data.Brand, result.Data.Title, result.Data.Price, result.Data.MRP, result.Data.URL)
 	}
-
-	if price == 0 { return 0, 0, "", fmt.Errorf("Price missing in top 150KB") }
-	if mrp == 0 { mrp = price }
-	if offers == "" { offers = "No offers found" }
-
-	return price, mrp, offers, nil
 }
 
-func sendToDiscord(name string, price, mrp float64, offers, link string) {
+func sendToDiscord(brand, title string, price, mrp float64, productURL string) {
 	webhookURL := os.Getenv("DISCORD_WEBHOOK_URL")
-	if webhookURL == "" { return }
+	if webhookURL == "" {
+		return
+	}
 
-	discount := ((mrp - price) / mrp) * 100
+	discount := 0.0
+	if mrp > 0 {
+		discount = ((mrp - price) / mrp) * 100
+	}
+
 	payload := map[string]interface{}{
 		"embeds": []map[string]interface{}{
 			{
-				"title": name, "url": link, "color": 3066993,
+				"title":       fmt.Sprintf("🚀 %s Deal Alert!", brand),
+				"url":         productURL,
+				"description": fmt.Sprintf("✨ **%s**", title),
+				"color":       3066993,
 				"fields": []map[string]interface{}{
-					{"name": "Price", "value": fmt.Sprintf("₹%.0f", price), "inline": true},
-					{"name": "Discount", "value": fmt.Sprintf("%.0f%%", discount), "inline": true},
-					{"name": "Bank", "value": offers, "inline": false},
+					{"name": "💰 Price", "value": fmt.Sprintf("`₹%.2f`", price), "inline": true},
+					{"name": "📉 MRP", "value": fmt.Sprintf("~~₹%.2f~~", mrp), "inline": true},
+					{"name": "🎉 Savings", "value": fmt.Sprintf("**%.0f%% OFF**", discount), "inline": true},
 				},
 			},
 		},
 	}
-	b, _ := json.Marshal(payload)
-	http.Post(webhookURL, "application/json", bytes.NewBuffer(b))
+
+	body, _ := json.Marshal(payload)
+	http.Post(webhookURL, "application/json", bytes.NewBuffer(body))
 }
